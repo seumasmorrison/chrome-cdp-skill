@@ -7,9 +7,9 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
-import { homedir } from 'os';
-import { resolve } from 'path';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync } from 'fs';
+import { homedir, tmpdir, platform } from 'os';
+import { resolve, join } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
 
@@ -19,26 +19,89 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const SOCK_PREFIX = '/tmp/cdp-';
-const PAGES_CACHE = '/tmp/cdp-pages.json';
 
-function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
+const IS_WIN = platform() === 'win32';
+const TMP_DIR = IS_WIN ? join(tmpdir(), 'cdp-cli') : '/tmp';
+if (IS_WIN) { try { mkdirSync(TMP_DIR, { recursive: true }); } catch {} }
 
-function getWsUrl() {
-  const portFile = resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort');
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+const SOCK_PREFIX = IS_WIN ? join(TMP_DIR, 'cdp-') : '/tmp/cdp-';
+const PAGES_CACHE = IS_WIN ? join(TMP_DIR, 'cdp-pages.json') : '/tmp/cdp-pages.json';
+
+// On Windows, Unix domain sockets don't work reliably. Use named pipes instead.
+function sockPath(targetId) {
+  if (IS_WIN) return `\\\\.\\pipe\\cdp-${targetId}`;
+  return `${SOCK_PREFIX}${targetId}.sock`;
+}
+
+async function getWsUrl() {
+  // Try DevToolsActivePort file first (works on all platforms when Chrome uses --user-data-dir default)
+  const portFilePaths = IS_WIN
+    ? [resolve(process.env.LOCALAPPDATA || '', 'Google/Chrome/User Data/DevToolsActivePort')]
+    : [resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort')];
+
+  for (const portFile of portFilePaths) {
+    try {
+      const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+      return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+    } catch {}
+  }
+
+  // Fallback: try HTTP discovery on common debug ports
+  for (const port of [9222, 9229]) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/json/version`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.webSocketDebuggerUrl) return data.webSocketDebuggerUrl;
+      }
+    } catch {}
+  }
+
+  throw new Error('Cannot find Chrome debug port. Enable remote debugging in chrome://inspect/#remote-debugging or launch Chrome with --remote-debugging-port=9222');
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function listDaemonSockets() {
+  if (IS_WIN) {
+    // On Windows we use named pipes; we can't enumerate them easily.
+    // Instead, maintain a registry file of active daemon target IDs.
+    const registryFile = join(TMP_DIR, 'cdp-daemons.json');
+    try {
+      const ids = JSON.parse(readFileSync(registryFile, 'utf8'));
+      return ids.map(targetId => ({
+        targetId,
+        socketPath: sockPath(targetId),
+      }));
+    } catch {
+      return [];
+    }
+  }
   return readdirSync('/tmp')
     .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
     .map(f => ({
       targetId: f.slice(4, -5),
       socketPath: `/tmp/${f}`,
     }));
+}
+
+function registerDaemon(targetId) {
+  if (!IS_WIN) return;
+  const registryFile = join(TMP_DIR, 'cdp-daemons.json');
+  let ids = [];
+  try { ids = JSON.parse(readFileSync(registryFile, 'utf8')); } catch {}
+  if (!ids.includes(targetId)) ids.push(targetId);
+  writeFileSync(registryFile, JSON.stringify(ids));
+}
+
+function unregisterDaemon(targetId) {
+  if (!IS_WIN) return;
+  const registryFile = join(TMP_DIR, 'cdp-daemons.json');
+  try {
+    let ids = JSON.parse(readFileSync(registryFile, 'utf8'));
+    ids = ids.filter(id => id !== targetId);
+    writeFileSync(registryFile, JSON.stringify(ids));
+  } catch {}
 }
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
@@ -431,7 +494,7 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -454,6 +517,7 @@ async function runDaemon(targetId) {
     alive = false;
     server.close();
     try { unlinkSync(sp); } catch {}
+    unregisterDaemon(targetId);
     cdp.close();
     process.exit(0);
   }
@@ -543,6 +607,7 @@ async function runDaemon(targetId) {
 
   try { unlinkSync(sp); } catch {}
   server.listen(sp);
+  registerDaemon(targetId);
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +816,7 @@ async function main() {
     if (!pages) {
       // No daemon running — connect directly (will trigger one Allow)
       const cdp = new CDP();
-      await cdp.connect(getWsUrl());
+      await cdp.connect(await getWsUrl());
       pages = await getPages(cdp);
       cdp.close();
     }
